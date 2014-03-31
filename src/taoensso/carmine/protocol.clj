@@ -24,6 +24,8 @@
 
 ;;;; Dynamic context stuff
 
+(encore/declare-remote taoensso.carmine.cluster/execute-requests)
+
 (defrecord Context [conn      ; active Connection
                     req-queue ; [<pulled-reqs> [<queued-req> ...]] atom
                     ])
@@ -254,7 +256,10 @@
            requests ; Atomically pull reqs from dynamic queue:
            (-> (swap! req-queue (fn [[_ q]] [q []]))
                (nth 0))]
-       (execute-requests conn requests get-replies? replies-as-pipeline?)))
+       (if (get-in conn [:spec :cluster])
+         (taoensso.carmine.cluster/execute-requests conn requests get-replies? replies-as-pipeline?)
+         (execute-requests conn requests get-replies? replies-as-pipeline?))))
+
 
   ;; For use with Cluster, etc.:
   ([conn requests get-replies? replies-as-pipeline?]

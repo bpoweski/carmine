@@ -49,13 +49,84 @@
 ;;   Parsers & other goodies will just work as expected since all that info is
 ;;   attached to the requests themselves.
 
+;; {<name> {<keyslot> <conn-spec>}}
+(def ^:private cached-keyslot-conn-specs (atom {}))
+
+(defn retryable? [obj]
+  (= (:prefix (ex-data obj)) :moved))
+
+(def max-retries 14)
+
+(defn parse-redirect [msg]
+  (let [[_ slot addr] (str/split msg #" ")]
+    (when-let [[host port] (str/split addr #":")]
+      [(encore/as-int slot) host (encore/as-int port)])))
+
+(defn find-spec [m slot conn]
+  (get-in m [(get-in conn [:spec :cluster]) slot] (:spec conn)))
+
+(defn send-request [conn-opts requests get-replies? replies-as-pipeline?]
+  (let [[pool conn] (conns/pooled-conn conn-opts)]
+    (try
+      (let [response (protocol/execute-requests conn requests get-replies? replies-as-pipeline?)]
+        (conns/release-conn pool conn)
+        response)
+      (catch Exception e
+        (conns/release-conn pool conn e)
+        e))))
+
+(defn keyslot-specs [cluster coll]
+  (into {}  (for [[request e] coll
+                  :let [[slot host port] (parse-redirect (.getMessage ^Exception e))]]
+              [slot {:host host :port port :cluster cluster}])))
+
+(defn execute-requests [conn get-replies? replies-as-pipeline? requests]
+  (let [cluster     (get-in conn [:spec :cluster])
+        requests    (map-indexed #(vary-meta %2 assoc :pos %1 :expected-keyslot (commands/keyslot (second %2))) requests) ;; comes through as nil?, temporary fix
+        group-fn    (fn [request] (find-spec (deref cached-keyslot-conn-specs) (:expected-keyslot (meta request)) conn))
+        placeholder (java.util.concurrent.TimeoutException.)]
+
+    (loop [plan         (group-by group-fn requests)
+           final-result (vec (repeat (count requests) placeholder))
+           n            0]
+      (let [responses    (for [[spec reqs] plan]
+                           [reqs (future (if (> (count reqs) 1)
+                                           (send-request {:spec spec} reqs get-replies? replies-as-pipeline?)
+                                           [(send-request {:spec spec} reqs get-replies? replies-as-pipeline?)]))])
+            ungrouped    (group-by (comp retryable? last) (for [[requests p] responses
+                                                                [request response] (map vector requests (deref p 5000 placeholder))]
+                                                            [request response]))
+            remaining    (get ungrouped true)
+            done         (get ungrouped false)
+            final-result (reduce (fn [coll [request response]]
+                                   (assoc coll (:pos (meta request)) response))
+                                 final-result
+                                 done)]
+
+        (swap! cached-keyslot-conn-specs update-in [cluster] merge (keyslot-specs cluster remaining))
+
+        (if (and (seq remaining) (< n max-retries))
+          (recur (group-by group-fn (map first remaining)) final-result (inc n))
+          final-result)))))
+
 (comment ; Example
 
   ;; Step 1:
-  (wcar {:cluster "foo"}
+  (car/wcar {:spec {:host "127.0.0.1" :port 7001 :cluster "foo"}}
     (car/get "key-a")
     (car/get "key-b")
     (car/get "key-c"))
+
+  (car/wcar {:spec {:host "127.0.0.1" :port 7002 :cluster "foo"}}
+    (car/get "key-f")
+    (car/get "key-a")
+    (car/get "key-b")
+    (car/get "key-l"))
+
+  (time (dotimes [n 1000]
+          (car/wcar {:spec {:host "127.0.0.1" :port 7001 :cluster "foo"}}
+            (doseq [n (range 100)]
+              (car/get (str "key-" n))))))
 
   ;; Step 2:
   ;; protocol/execute-requests will receive requests as:
